@@ -1,0 +1,182 @@
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: mysql-secret
+type: Opaque
+data:
+  # values are encoded with base64
+  # when logging in to the DB you will need to use the decoded values
+  root_password: c2VjcmV0MTIz  # "secret123"
+  replication_password: cmVwbGljYXRpb24xMjM=  # "replication123"
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mysql-service
+spec:
+  clusterIP: None
+  selector:
+    app: mysql
+  ports:
+    - name: mysql
+      port: 3306
+      targetPort: 3306
+
+---
+# this configmap holds the scripts that will be executed on the mysql container
+# the init container will decide which script will be executed based on the name of the host
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: init-script
+data:
+  master.sh: |
+    #!/bin/bash
+    echo "Setting up replication user..."
+
+    mysql -u root -p"$MYSQL_ROOT_PASSWORD" -e "
+    CREATE USER 'replication'@'%' IDENTIFIED BY '$MYSQL_REPLICATION_PASSWORD';
+    GRANT REPLICATION SLAVE ON *.* TO 'replication'@'%';
+    FLUSH PRIVILEGES;
+    "
+
+    echo "Replication user setup completed."
+
+  slave.sh: |
+    #!/bin/bash
+    # Wait for master to be available
+    until mysql -h mysql-0.mysql-service -u root -p$MYSQL_ROOT_PASSWORD -e "SELECT 1"; do
+      echo 'Waiting for master...' && sleep 10
+    done
+
+    echo "Master is available, configuring slave..."
+
+    # Get master status information (binlog file and position)
+    MASTER_STATUS=$(mysql -h mysql-0.mysql-service -u root -p$MYSQL_ROOT_PASSWORD -e "SHOW MASTER STATUS\G")
+    MASTER_LOG_FILE=$(echo "$MASTER_STATUS" | grep "File:" | awk '{print $2}')
+    MASTER_LOG_POS=$(echo "$MASTER_STATUS" | grep "Position:" | awk '{print $2}')
+
+    echo "Master log file: $MASTER_LOG_FILE, position: $MASTER_LOG_POS"
+
+    # Configure slave
+    mysql -u root -p$MYSQL_ROOT_PASSWORD -e "
+    STOP SLAVE;
+    CHANGE MASTER TO
+      MASTER_HOST='mysql-0.mysql-service',
+      MASTER_USER='replication',
+      MASTER_PASSWORD='$MYSQL_REPLICATION_PASSWORD',
+      MASTER_LOG_FILE='$MASTER_LOG_FILE',
+      MASTER_LOG_POS=$MASTER_LOG_POS;
+    START SLAVE;
+    "
+
+---
+# this configmap holds the config files that will be mounted on the mysql container
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mysql-config-map
+data:
+  master.cnf: |
+    [mysqld]
+    log-bin=mysql-bin
+    binlog-format=ROW
+    default_authentication_plugin=mysql_native_password
+  slave.cnf: |
+    [mysqld]
+    relay-log=relay-bin
+    read-only=1
+    default_authentication_plugin=mysql_native_password
+
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mysql
+spec:
+  # what service will expose this statefulset
+  serviceName: mysql-service
+  replicas: 2
+  selector:
+    matchLabels:
+      app: mysql
+  template:
+    metadata:
+      labels:
+        app: mysql
+    spec:
+      containers:
+        - name: mysql
+          image: mysql:8.0
+          env:
+            - name: MYSQL_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: mysql-secret
+                  key: root_password
+            - name: MYSQL_REPLICATION_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: mysql-secret
+                  key: replication_password
+          ports:
+            - containerPort: 3306
+          volumeMounts:
+            - name: auxiliar-volume-for-mysql-config
+              mountPath: /etc/mysql/conf.d
+            - name: auxiliar-volume-for-init-script
+              mountPath: /docker-entrypoint-initdb.d
+      # use a init container to do some setup
+      initContainers:
+      - name: init-mysql
+        image: mysql:8
+        imagePullPolicy: IfNotPresent
+        # the server id file will be created on this volume
+        # and loaded to mysql container later
+        volumeMounts:
+          - name: auxiliar-volume-for-mysql-config
+            mountPath: /mnt/
+          # load files from config map
+          - name: mysql-config-map-volume
+            mountPath: /mysql-config-map-volume
+          # this holds the scripts from config map
+          - name: init-script-volume
+            mountPath: /scripts
+          - name: auxiliar-volume-for-init-script
+            mountPath: /init-script
+        command:
+          - bash
+          - "-c"
+          - |
+            set -e
+            # Extract ordinal from hostname
+            ordinal=${HOSTNAME##*-}
+            # here a file with the server id is created that later will be loaded to mysql container
+            echo -e "[mysqld]\nserver-id=$((100 + ordinal))" > /mnt/server-id.cnf
+
+            # get role from hostname
+            role=$( [ "$ordinal" -eq 0 ] && echo "master" || echo "slave" )
+
+            echo  "Init container setting up $role"
+
+            if [ "$role" == "master" ]; then
+              cp /mysql-config-map-volume/master.cnf /mnt/
+              cp /scripts/master.sh /init-script/
+            else
+              cp /mysql-config-map-volume/slave.cnf /mnt/
+              cp /scripts/slave.sh /init-script/
+            fi
+      volumes:
+        - name: mysql-config-map-volume
+          configMap:
+            name: mysql-config-map
+        - name: init-script-volume
+          configMap:
+            name: init-script
+        - name: auxiliar-volume-for-mysql-config
+          emptyDir: {}
+        - name: auxiliar-volume-for-init-script
+          emptyDir: {}
+
