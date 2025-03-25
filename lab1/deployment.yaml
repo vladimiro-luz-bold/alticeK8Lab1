@@ -40,5 +40,4 @@ spec:
       volumes:
         - name: storage-volume
           persistentVolumeClaim:
-            #claimName: my-pvc
-            claimName: missing-pvc
+            claimName: missing-pvc  # Ensure this PVC exists in your cluster
